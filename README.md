@@ -1,4 +1,4 @@
-# AI-Powered ATS Resume & Job Match Analyzer (Enterprise Edition v9 - Supabase Postgres)
+# AI-Powered ATS Resume & Job Match Analyzer (Enterprise Edition - Supabase Postgres)
 
 A complete 7th-semester Natural Language Processing (NLP) & Full-Stack web application built with **Python**, **Supabase (PostgreSQL)**, **Brevo Transactional Email API**, **Scikit-Learn**, and **Streamlit**.
 
