@@ -1,0 +1,15 @@
+[theme]
+primaryColor = "#5b6ef5"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"      # never show stack traces / internals to users
+
+[server]
+maxUploadSize = 10             # MB hard cap per upload (the app enforces 5 MB per PDF)
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+gatherUsageStats = false

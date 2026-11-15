@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.DS_Store
+.streamlit/secrets.toml
+*.db
+*.sqlite3
+.env.*
+*.pem
+*.key
