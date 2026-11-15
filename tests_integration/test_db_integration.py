@@ -50,6 +50,21 @@ class DatabaseIntegrationTests(SchemaTestCase):
         stored = self.sql("SELECT password_hash FROM users")[0][0]
         self.assertTrue(stored.startswith("pbkdf2$"))
 
+    def test_login_with_username_or_email_reaches_the_same_account(self):
+        user = self.make_user()
+        for identifier in ("aarav.s", "AARAV.S", "aarav@example.com", " Aarav@Example.COM "):
+            self.assertEqual(self.ns["authenticate_user"](identifier, PW)[0], user[0], identifier)
+        self.assertIsNone(self.ns["authenticate_user"]("aarav@example.com", "wrong-pass"))
+        self.make_user("second", "second@example.com")
+        self.assertEqual(self.ns["authenticate_user"]("second@example.com", PW)[1], "second")  # no cross-account match
+
+    def test_failed_logins_by_email_and_username_share_one_lockout(self):
+        self.make_user()
+        for identifier in ("aarav@example.com", "aarav.s", "aarav@example.com", "aarav.s", "aarav@example.com"):
+            self.assertIsNone(self.ns["authenticate_user"](identifier, "wrong-pass"))
+        with self.assertRaises(self.ns["AccountLocked"]):
+            self.ns["authenticate_user"]("aarav.s", PW)
+
     def test_duplicate_username_and_email_rejected(self):
         self.make_user()
         ok, msg = self.ns["register_user"]("aarav.s", "X", "other@example.com", PW)
@@ -352,6 +367,150 @@ class DatabaseIntegrationTests(SchemaTestCase):
         blob = repr(self.ns["get_admin_metrics"](admin_id, 30)).lower()
         for secret in ("@example.com", "a1", "cv.pdf", "pbkdf2", "boss"):
             self.assertNotIn(secret, blob)
+
+    # ---- upgrades: email verification, remember-me, account deletion, staff roles, CSV import, saved progress ----
+    def with_email_service(self):
+        cfg = {"BREVO_API_KEY": "k", "BREVO_SENDER_EMAIL": "from@example.com", "OTP_PEPPER": "pep"}
+        self.ns["get_config"] = lambda name, default="": cfg.get(name, default)
+        self.codes = []
+        self.ns["send_verification_email_brevo"] = lambda email, name, user, code: (self.codes.append((email, code)) or (True, "ok"))
+
+    def tearDown(self):
+        self.ns["get_config"] = load_app()["get_config"]  # restore the real config reader for the next test
+
+    def test_signup_login_verification_flow(self):
+        self.with_email_service()
+        self.assertTrue(self.ns["register_user"]("aarav.s", "Aarav", "aarav@example.com", PW)[0])
+        self.assertEqual(self.sql("SELECT email_verified FROM users")[0][0], False)
+        email, code = self.codes[-1]
+        self.assertEqual(email, "aarav@example.com")
+        self.assertNotEqual(self.sql("SELECT code_digest FROM email_verifications")[0][0], code)     # digest only
+        with self.assertRaises(self.ns["EmailNotVerified"]):
+            self.ns["authenticate_user"]("aarav.s", PW)                                              # right password, unverified
+        self.assertIsNone(self.ns["authenticate_user"]("aarav.s", "wrong-pass"))                    # wrong password: same as always
+        uid = self.sql("SELECT id FROM users")[0][0]
+        self.assertFalse(self.ns["verify_email_code"](uid, "000000" if code != "000000" else "111111"))
+        self.assertTrue(self.ns["verify_email_code"](uid, code))
+        self.assertFalse(self.ns["verify_email_code"](uid, code))                                    # single use
+        self.assertIsNotNone(self.ns["authenticate_user"]("aarav.s", PW))
+
+    def test_verification_guess_limit_resend_limit_and_expiry(self):
+        self.with_email_service()
+        self.ns["register_user"]("aarav.s", "Aarav", "aarav@example.com", PW)
+        uid = self.sql("SELECT id FROM users")[0][0]
+        code = self.codes[-1][1]
+        wrong = "000000" if code != "000000" else "111111"
+        for _ in range(5):
+            self.ns["verify_email_code"](uid, wrong)
+        self.assertFalse(self.ns["verify_email_code"](uid, code))                                    # locked after 5 wrong guesses
+        self.assertTrue(self.ns["send_verification_code"](uid))                                      # resend works (2nd code)
+        self.assertTrue(self.ns["send_verification_code"](uid))                                      # 3rd
+        self.assertFalse(self.ns["send_verification_code"](uid))                                     # 4th this hour: refused
+        self.sql("UPDATE email_verifications SET expires_at = now() - interval '1 minute'")
+        self.assertFalse(self.ns["verify_email_code"](uid, self.codes[-1][1]))                       # expired
+
+    def test_unverified_signup_cannot_squat_an_address(self):
+        self.with_email_service()
+        self.ns["register_user"]("squatter", "Mallory", "victim@example.com", PW)
+        self.assertTrue(self.ns["register_user"]("realowner", "Victim", "victim@example.com", PW)[0])  # real owner replaces it
+        self.assertEqual(self.sql("SELECT username FROM users")[0][0], "realowner")
+        uid = self.sql("SELECT id FROM users")[0][0]
+        self.assertTrue(self.ns["verify_email_code"](uid, self.codes[-1][1]))
+        self.assertFalse(self.ns["register_user"]("third", "X", "victim@example.com", PW)[0])         # verified address is protected
+
+    def test_remember_tokens(self):
+        user = self.make_user()
+        token = self.ns["create_remember_token"](user[0])
+        self.assertEqual(self.ns["user_from_remember_token"](token)[1], "aarav.s")
+        self.assertNotIn(token, str(self.sql("SELECT token_digest FROM remember_tokens")))           # digest only
+        self.ns["change_user_password"](user[0], PW, "NewStr0ng!1")                                  # password change kills it
+        self.assertIsNone(self.ns["user_from_remember_token"](token))
+        token2 = self.ns["create_remember_token"](user[0])
+        self.ns["revoke_remember_token"](token2)                                                     # logout kills it
+        self.assertIsNone(self.ns["user_from_remember_token"](token2))
+        token3 = self.ns["create_remember_token"](user[0])
+        self.sql("UPDATE remember_tokens SET expires_at = now() - interval '1 minute'")
+        self.assertIsNone(self.ns["user_from_remember_token"](token3))                               # expired
+        self.assertIsNone(self.ns["user_from_remember_token"]("A" * 43))                            # unknown
+
+    def test_only_five_remember_tokens_per_user(self):
+        user = self.make_user()
+        tokens = [self.ns["create_remember_token"](user[0]) for _ in range(7)]
+        self.assertEqual(self.sql("SELECT count(*) FROM remember_tokens")[0][0], 5)
+        self.assertIsNone(self.ns["user_from_remember_token"](tokens[0]))                            # oldest were dropped
+        self.assertIsNotNone(self.ns["user_from_remember_token"](tokens[-1]))
+
+    def test_delete_account_removes_everything(self):
+        user = self.make_user()
+        self.ns["save_scan_record"](user[0], "cv.pdf", "Role", 50.0, 1, [])
+        self.ns["initiate_password_reset"]("aarav.s")
+        self.ns["create_remember_token"](user[0])
+        self.ns["save_roadmap_progress"](user[0], "0123abcd", {"1_0"})
+        self.assertFalse(self.ns["delete_user_account"](user[0], "wrong-pass")[0])                   # wrong password: nothing happens
+        self.assertEqual(self.sql("SELECT count(*) FROM users")[0][0], 1)
+        self.assertTrue(self.ns["delete_user_account"](user[0], PW)[0])
+        for table in ("users", "scans", "password_resets", "remember_tokens", "roadmap_progress", "email_verifications"):
+            self.assertEqual(self.sql(f"SELECT count(*) FROM {table}")[0][0], 0, table)
+
+    def test_staff_roles_department_admin_and_audit_log(self):
+        boss = self.admin()
+        for n in ("a1", "a2", "a3"):
+            self.student(n, "Civil", scans=[50 + len(n)])
+        self.student("m1", "Mechanical", scans=[40]); self.student("m2", "Mechanical", scans=[60]); self.student("m3", "Mechanical", scans=[80])
+        dean = self.student("dean", "Civil")
+        self.assertTrue(self.ns["set_user_role"](boss, "dean", "dept_admin")[0])
+        with self.assertRaises(PermissionError):
+            self.ns["set_user_role"](dean[0], "a1", "admin")                                         # dept admins can't change roles
+        m = self.ns["get_admin_metrics"](dean[0], 30, "Mechanical")                                  # asks for Mechanical...
+        self.assertEqual(m["department"], "Civil")                                                   # ...gets Civil
+        self.assertEqual([r["Department"] for r in m["by_department"]], ["Civil"])
+        with self.assertRaises(PermissionError):
+            self.ns["list_staff"](dean[0])
+        self.assertTrue(any(r["Action"] == "role:student->dept_admin" and r["Target"] == "dean" for r in self.ns["list_audit_log"](boss)))
+        self.assertFalse(self.ns["set_user_role"](boss, "boss", "student")[0])                       # the last admin stays an admin
+        self.assertEqual(self.sql("SELECT role FROM users WHERE username='boss'")[0][0], "admin")
+
+    def test_dept_admin_needs_a_department_and_a_verified_email(self):
+        boss = self.admin()
+        self.student("nodept", "Unspecified")
+        self.assertFalse(self.ns["set_user_role"](boss, "nodept", "dept_admin")[0])
+        self.student("unv", "Civil")
+        self.sql("UPDATE users SET email_verified = FALSE WHERE username = 'unv'")
+        self.assertFalse(self.ns["set_user_role"](boss, "unv", "admin")[0])
+
+    def test_csv_import_end_to_end(self):
+        boss = self.admin()
+        self.student("existing", "Civil")
+        rows, problems = self.ns["parse_student_csv"](
+            "full_name,email,department\nSam One,sam@a.edu,Civil\nSam Two,sam@b.edu,Civil\nOld,existing@example.com,Civil\n")
+        self.assertEqual(problems, [])
+        self.assertEqual(self.ns["bulk_import_students"](boss, rows), {"created": 2, "skipped": 1})
+        names = sorted(r[0] for r in self.sql("SELECT username FROM users WHERE email IN ('sam@a.edu','sam@b.edu')"))
+        self.assertEqual(names, ["sam", "sam1"])                                                     # collision resolved
+        self.assertIsNone(self.ns["authenticate_user"]("sam@a.edu", "anything-at-all"))              # no usable password
+        self.ns["initiate_password_reset"]("sam@a.edu")                                              # they set one via Forgot password
+        self.assertTrue(self.ns["verify_otp_and_reset_password"]("sam@a.edu", self.sent[-1][1], "Imported!Pass1")[0])
+        self.assertEqual(self.ns["authenticate_user"]("sam@a.edu", "Imported!Pass1")[1], "sam")
+        with self.assertRaises(PermissionError):
+            self.ns["bulk_import_students"](self.student("plain")[0], rows)                          # students can't import
+
+    def test_roadmap_progress_roundtrip_and_trim(self):
+        user = self.make_user()
+        self.assertEqual(self.ns["load_roadmap_progress"](user[0], "0123abcd"), set())
+        self.ns["save_roadmap_progress"](user[0], "0123abcd", {"1_0", "2_1"})
+        self.ns["save_roadmap_progress"](user[0], "0123abcd", {"1_0", "2_1", "3_0"})                 # upsert, not duplicate
+        self.assertEqual(self.ns["load_roadmap_progress"](user[0], "0123abcd"), {"1_0", "2_1", "3_0"})
+        for i in range(25):
+            self.ns["save_roadmap_progress"](user[0], f"{i:08x}", {"1_0"})
+        self.assertEqual(self.sql("SELECT count(*) FROM roadmap_progress")[0][0], 20)                # only the newest 20 plans kept
+        other = self.make_user("second", "second@example.com")
+        self.assertEqual(self.ns["load_roadmap_progress"](other[0], "0000000a"), set())              # other users can't see it
+
+    def test_new_tables_have_row_level_security(self):
+        rows = self.sql(
+            "SELECT c.relname, c.relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname IN ('email_verifications','remember_tokens','roadmap_progress','admin_audit')", (self.schema,))
+        self.assertEqual({r[0]: r[1] for r in rows}, {t: True for t in ("email_verifications", "remember_tokens", "roadmap_progress", "admin_audit")})
 
 
 if __name__ == "__main__":

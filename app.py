@@ -7,6 +7,10 @@ import logging
 import hmac
 import html
 import threading
+import csv
+import io
+import zipfile
+import xml.etree.ElementTree as ET
 import hashlib
 import secrets
 import psycopg2
@@ -57,7 +61,10 @@ def db_cursor():
 
 @st.cache_resource(show_spinner="Connecting to Supabase...")
 def _init_db_cached():
-    """Creates tables in Supabase Postgres (runs once per server process)."""
+    """Creates tables in Supabase Postgres (runs once per server process).
+    Set SKIP_DB_INIT=true once the schema exists, so the app can run with a limited database role that cannot run DDL."""
+    if get_config("SKIP_DB_INIT", "").lower() in ("1", "true", "yes", "on"):
+        return True
     with db_cursor() as c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -79,6 +86,49 @@ def _init_db_cached():
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'student' CHECK (role IN ('student', 'admin'))")
         c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT NOT NULL DEFAULT 'Unspecified'")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT TRUE")  # existing accounts count as verified
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS email_verifications (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+                code_digest TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                used BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS remember_tokens (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+                token_digest TEXT NOT NULL UNIQUE,
+                token_version INTEGER NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_verifications_user ON email_verifications (user_id, id DESC)")
+        c.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check")  # widen to include department administrators
+        c.execute("ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('student', 'dept_admin', 'admin'))")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS roadmap_progress (
+                user_id BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+                plan_sig TEXT NOT NULL,
+                done_keys TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (user_id, plan_sig)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                admin_id BIGINT REFERENCES users (id) ON DELETE SET NULL,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS password_resets (
                 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -111,7 +161,7 @@ def _init_db_cached():
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users (LOWER(email))")
         # Block Supabase's public REST API from touching these tables. The direct
         # Postgres connection used by this app is unaffected.
-        for table in ("users", "password_resets", "scans"):
+        for table in ("users", "password_resets", "scans", "email_verifications", "remember_tokens", "roadmap_progress", "admin_audit"):
             c.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
     return True
 
@@ -147,7 +197,7 @@ K_ANON_MIN_GROUP = 3                   # admin analytics never show a group smal
 ADMIN_WINDOWS = (7, 30, 90, 365)       # selectable reporting windows, in days
 MAX_EDITOR_CHARS = 30000
 ROADMAP_MAX_SKILLS = 8
-LOGIN_FAILED_MSG = ("Invalid username or password. After "
+LOGIN_FAILED_MSG = ("Invalid username/email or password. After "
                     "5 failed attempts an account is locked for 15 minutes.")
 MIN_PASSWORD_LEN = 8
 MAX_PASSWORD_LEN = 128
@@ -166,6 +216,12 @@ class AccountLocked(Exception):
     def __init__(self, seconds):
         super().__init__("account locked")
         self.seconds = seconds
+
+class EmailNotVerified(Exception):
+    """Raised after a correct password on an account whose email address has not been verified yet."""
+    def __init__(self, user_id):
+        super().__init__("email not verified")
+        self.user_id = user_id
 
 def valid_department(value):
     """True for a known department (or the 'Unspecified' placeholder)."""
@@ -246,15 +302,26 @@ def register_user(username, full_name, email, password, department=UNSPECIFIED_D
         return False, pw_error
     if not valid_department(department):
         return False, "Please choose a department from the list."
+    verify = verification_enabled()
+    code, new_id = None, None
     try:
         with db_cursor() as c:
+            if verify:  # a sign-up that never proved it owns the address must not block the real owner
+                c.execute("DELETE FROM users WHERE LOWER(email) = %s AND email_verified = FALSE", (email,))
             c.execute("SELECT 1 FROM users WHERE LOWER(email) = %s", (email,))
             if c.fetchone():
                 return False, "An account with this email already exists."
             c.execute(
-                "INSERT INTO users (username, full_name, email, password_hash, department) VALUES (%s, %s, %s, %s, %s)",
-                (username, full_name, email, hash_password(password), department)
+                "INSERT INTO users (username, full_name, email, password_hash, department, email_verified) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (username, full_name, email, hash_password(password), department, not verify)
             )
+            new_id = (c.fetchone() or (None,))[0]
+            if verify and new_id:
+                code = _issue_verification(c, new_id)
+        if code:
+            _dispatch(_deliver_verification, new_id, email, full_name, username, code)
+            return True, "Account created! We emailed a 6-digit code to verify your email address. Log in to enter it."
         return True, "Account created successfully! Please log in."
     except psycopg2.errors.UniqueViolation:
         return False, "Username or email already exists. Please choose another."
@@ -262,18 +329,328 @@ def register_user(username, full_name, email, password, department=UNSPECIFIED_D
         logger.exception("Registration failed")
         return False, "Registration failed. Please try again later."
 
-def authenticate_user(username, password):
-    """Verifies credentials; returns (id, username, full_name, email, created_at) or None.
+# ---------- email verification ----------
+VERIFY_CODE_MINUTES = 30
+VERIFY_MAX_ATTEMPTS = 5
+VERIFY_SENDS_PER_HOUR = 3
+REMEMBER_DAYS = 14
+MAX_REMEMBER_TOKENS = 5
+REMEMBER_COOKIE = "ats_remember"
+
+def verification_enabled():
+    """Sign-up email verification is on whenever the email service is configured (turn off with REQUIRE_EMAIL_VERIFICATION=false)."""
+    if get_config("REQUIRE_EMAIL_VERIFICATION", "true").lower() in ("0", "false", "no", "off"):
+        return False
+    return bool(get_config("BREVO_API_KEY") and get_config("BREVO_SENDER_EMAIL"))
+
+def _dispatch(fn, *args):
+    """Runs a slow job (sending email) in the background, or inline when OTP_ASYNC_DELIVERY is off (tests)."""
+    if OTP_ASYNC_DELIVERY:
+        threading.Thread(target=fn, args=args, daemon=True).start()
+    else:
+        fn(*args)
+
+def _issue_verification(c, user_id):
+    """Invalidates older codes and stores a new keyed digest of a fresh 6-digit code. Returns the plaintext code (for the email only)."""
+    c.execute("UPDATE email_verifications SET used = TRUE WHERE user_id = %s", (user_id,))
+    code = f"{secrets.randbelow(900000) + 100000}"
+    c.execute("INSERT INTO email_verifications (user_id, code_digest, expires_at) VALUES (%s, %s, %s)",
+              (user_id, _otp_digest(code), datetime.now(timezone.utc) + timedelta(minutes=VERIFY_CODE_MINUTES)))
+    return code
+
+def send_verification_email_brevo(recipient_email, full_name, username, code):
+    """Emails the sign-up verification code through the Brevo HTTPS API."""
+    api_key, sender_email = get_config("BREVO_API_KEY"), get_config("BREVO_SENDER_EMAIL")
+    if not api_key or not sender_email:
+        return False, "BREVO_NOT_CONFIGURED"
+    payload = {
+        "sender": {"name": get_config("BREVO_SENDER_NAME", "AI ATS Resume Analyzer"), "email": sender_email},
+        "to": [{"email": recipient_email, "name": full_name}],
+        "subject": "Verify your email - AI ATS Resume Analyzer",
+        "htmlContent": f"""
+        <div style="font-family: Arial, sans-serif; max-width: 520px; margin: auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+            <h2 style="color: #1f4e78;">Verify your email</h2>
+            <p>Hello <strong>{html.escape(full_name)}</strong>, welcome to AI ATS Resume Analyzer (<code>@{html.escape(username)}</code>).</p>
+            <p>Your 6-digit verification code is:</p>
+            <div style="font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #0b5394; background: #f0f4f8; padding: 12px; text-align: center; border-radius: 6px; margin: 16px 0;">{code}</div>
+            <p style="color: #555;">This code expires in <strong>{VERIFY_CODE_MINUTES} minutes</strong>. If you did not create this account, ignore this email.</p>
+        </div>"""
+    }
+    try:
+        response = requests.post("https://api.brevo.com/v3/smtp/email", json=payload, timeout=15,
+                                 headers={"accept": "application/json", "api-key": api_key, "content-type": "application/json"})
+        return (True, "sent") if response.status_code in (200, 201, 202) else (False, f"Brevo API Error ({response.status_code})")
+    except Exception as exc:
+        return False, f"Network Error: {type(exc).__name__}"
+
+def _deliver_verification(user_id, email, full_name, username, code):
+    try:
+        sent, status = send_verification_email_brevo(email, full_name, username, code)
+    except Exception as exc:
+        sent, status = False, type(exc).__name__
+    if not sent:
+        logger.error("Verification email not delivered: user_id=%s reason=%s", user_id, status)
+
+def send_verification_code(user_id):
+    """Sends a fresh code to an unverified account (max VERIFY_SENDS_PER_HOUR per hour). Returns True if one was sent."""
+    with db_cursor() as c:
+        c.execute("SELECT email, full_name, username, email_verified FROM users WHERE id = %s", (user_id,))
+        row = c.fetchone()
+        if not row or row[3]:
+            return False
+        c.execute("SELECT count(*) FROM email_verifications WHERE user_id = %s AND created_at > now() - interval '1 hour'", (user_id,))
+        if c.fetchone()[0] >= VERIFY_SENDS_PER_HOUR:
+            return False
+        code = _issue_verification(c, user_id)
+    _dispatch(_deliver_verification, user_id, row[0], row[1], row[2], code)
+    return True
+
+def verify_email_code(user_id, code):
+    """Checks a verification code (single use, expiring, 5 guesses). Marks the email verified on success."""
+    code = (code or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return False
+    with db_cursor() as c:
+        c.execute("SELECT id, code_digest, expires_at, attempts FROM email_verifications "
+                  "WHERE user_id = %s AND used = FALSE ORDER BY id DESC LIMIT 1 FOR UPDATE", (user_id,))
+        row = c.fetchone()
+        if not row:
+            return False
+        if datetime.now(timezone.utc) > row[2]:
+            c.execute("UPDATE email_verifications SET used = TRUE WHERE id = %s", (row[0],))
+            return False
+        if not hmac.compare_digest(_otp_digest(code).encode(), row[1].encode()):
+            c.execute("UPDATE email_verifications SET attempts = attempts + 1, used = %s WHERE id = %s",
+                      (row[3] + 1 >= VERIFY_MAX_ATTEMPTS, row[0]))
+            return False
+        c.execute("UPDATE email_verifications SET used = TRUE WHERE id = %s", (row[0],))
+        c.execute("UPDATE users SET email_verified = TRUE WHERE id = %s", (user_id,))
+    return True
+
+# ---------- "keep me signed in" (remember-me tokens) ----------
+def create_remember_token(user_id):
+    """Creates a random token for the browser cookie; only a keyed digest is stored. Returns None for unknown users."""
+    token = secrets.token_urlsafe(32)
+    with db_cursor() as c:
+        c.execute("SELECT token_version FROM users WHERE id = %s", (user_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        c.execute("INSERT INTO remember_tokens (user_id, token_digest, token_version, expires_at) VALUES (%s, %s, %s, %s)",
+                  (user_id, _otp_digest(token), row[0], datetime.now(timezone.utc) + timedelta(days=REMEMBER_DAYS)))
+        c.execute("DELETE FROM remember_tokens WHERE user_id = %s AND id NOT IN "
+                  "(SELECT id FROM remember_tokens WHERE user_id = %s ORDER BY id DESC LIMIT %s)",
+                  (user_id, user_id, MAX_REMEMBER_TOKENS))
+    return token
+
+def user_from_remember_token(token):
+    """Returns (id, username, full_name, email, created_at) for a valid, unexpired token, else None.
+    A token dies when the password changes (token_version), the email is unverified, or the account is deleted."""
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token):
+        return None
+    digest = _otp_digest(token)
+    with db_cursor() as c:
+        c.execute("SELECT u.id, u.username, u.full_name, u.email, to_char(u.created_at, 'YYYY-MM-DD HH24:MI'), "
+                  "rt.expires_at, rt.token_version, u.token_version, u.email_verified "
+                  "FROM remember_tokens rt JOIN users u ON u.id = rt.user_id WHERE rt.token_digest = %s", (digest,))
+        row = c.fetchone()
+        if not row:
+            return None
+        if row[5] <= datetime.now(timezone.utc) or row[6] != row[7] or not row[8]:
+            c.execute("DELETE FROM remember_tokens WHERE token_digest = %s", (digest,))
+            return None
+        return tuple(row[:5])
+
+def revoke_remember_token(token):
+    """Deletes one remember-me token (logout)."""
+    if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token):
+        with db_cursor() as c:
+            c.execute("DELETE FROM remember_tokens WHERE token_digest = %s", (_otp_digest(token),))
+
+# ---------- account deletion ----------
+def delete_user_account(user_id, password):
+    """Permanently deletes an account and (by cascade) its scans, codes and tokens, after re-checking the password."""
+    with db_cursor() as c:
+        c.execute("SELECT password_hash, role, failed_logins, locked_until FROM users WHERE id = %s FOR UPDATE", (user_id,))
+        row = c.fetchone()
+        if not row:
+            return False, "Account not found."
+        if row[3] and row[3] > datetime.now(timezone.utc):
+            return False, "Too many failed attempts. Please try again later."
+        if not verify_password(password or "", row[0]):
+            _register_failed_attempt(c, user_id, row[2])
+            return False, "Password is incorrect."
+        if row[1] == "admin":
+            c.execute("SELECT count(*) FROM users WHERE role = 'admin'")
+            if c.fetchone()[0] <= 1:
+                return False, "You are the only administrator. Make another administrator first."
+        c.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    logger.info("Account deleted by its owner: user_id=%s", user_id)
+    return True, "Your account and all your data have been deleted."
+
+# ---------- staff roles, audit log, CSV import, saved roadmap progress ----------
+ROLES = ("student", "dept_admin", "admin")
+MAX_IMPORT_ROWS = 300
+MAX_IMPORT_BYTES = 200_000
+
+def _require_staff(c, user_id):
+    """Allows administrators and department administrators. Returns (role, department)."""
+    c.execute("SELECT role, department FROM users WHERE id = %s", (user_id,))
+    row = c.fetchone()
+    if not row or row[0] not in ("admin", "dept_admin"):
+        logger.warning("Staff access denied: user_id=%s", user_id)
+        raise PermissionError("Administrator access required.")
+    return row[0], row[1]
+
+def _audit(c, admin_id, action, target):
+    c.execute("INSERT INTO admin_audit (admin_id, action, target) VALUES (%s, %s, %s)", (admin_id, action[:40], clean_line(target, 80)))
+
+def list_staff(admin_id):
+    """Administrators and department administrators (username, name, role, department). Full admins only."""
+    with db_cursor() as c:
+        _require_admin(c, admin_id)
+        c.execute("SELECT username, full_name, role, department FROM users WHERE role <> 'student' ORDER BY role, username")
+        return [{"Username": r[0], "Name": r[1], "Role": r[2], "Department": r[3]} for r in c.fetchall()]
+
+def list_audit_log(admin_id, limit=25):
+    """Most recent administrative actions. Full admins only."""
+    with db_cursor() as c:
+        _require_admin(c, admin_id)
+        c.execute("SELECT to_char(a.created_at, 'YYYY-MM-DD HH24:MI'), COALESCE(u.username, '(deleted)'), a.action, a.target "
+                  "FROM admin_audit a LEFT JOIN users u ON u.id = a.admin_id ORDER BY a.id DESC LIMIT %s", (max(1, min(int(limit), 100)),))
+        return [{"When": r[0], "Admin": r[1], "Action": r[2], "Target": r[3]} for r in c.fetchall()]
+
+def set_user_role(admin_id, username, new_role):
+    """Promotes or demotes a user. Full admins only; the last administrator can never be removed. Returns (ok, message)."""
+    username = (username or "").strip().lower()
+    if new_role not in ROLES:
+        return False, "Unknown role."
+    if not re.fullmatch(r"[a-z0-9_.-]{3,30}", username):
+        return False, "Enter a valid username."
+    with db_cursor() as c:
+        _require_admin(c, admin_id)
+        c.execute("SELECT id, role, department, email_verified FROM users WHERE username = %s FOR UPDATE", (username,))
+        target = c.fetchone()
+        if not target:
+            return False, "No user with that username."
+        if not target[3]:
+            return False, "That account's email address is not verified yet."
+        if target[1] == new_role:
+            return False, f"They already have the {new_role} role."
+        if target[1] == "admin" and new_role != "admin":
+            c.execute("SELECT count(*) FROM users WHERE role = 'admin'")
+            if c.fetchone()[0] <= 1:
+                return False, "At least one administrator must remain."
+        if new_role == "dept_admin" and target[2] == UNSPECIFIED_DEPT:
+            return False, "Set this user's department first (they can do it on their Account page)."
+        c.execute("UPDATE users SET role = %s WHERE id = %s", (new_role, target[0]))
+        _audit(c, admin_id, f"role:{target[1]}->{new_role}", username)
+    logger.info("Role changed: admin_id=%s target=%s new_role=%s", admin_id, username, new_role)
+    return True, f"{username} is now: {new_role}."
+
+def parse_student_csv(text):
+    """Parses an uploaded CSV (columns: full_name or name, email; optional department, username).
+    Returns (rows, problems); bad rows are reported, never imported."""
+    if len(text.encode("utf-8", "ignore")) > MAX_IMPORT_BYTES:
+        return [], ["The file is too large."]
+    rows, problems, seen = [], [], set()
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        fields = {(f or "").strip().lower().replace(" ", "_"): f for f in (reader.fieldnames or [])}
+        name_key, email_key = fields.get("full_name") or fields.get("name"), fields.get("email")
+        if not name_key or not email_key:
+            return [], ["The CSV needs the columns full_name (or name) and email. Optional: department, username."]
+        for n, raw in enumerate(reader, start=2):
+            if len(rows) + len(problems) >= MAX_IMPORT_ROWS:
+                problems.append(f"Stopped after {MAX_IMPORT_ROWS} rows. Import the rest in another file.")
+                break
+            name = clean_line(raw.get(name_key) or "", MAX_NAME_LEN)
+            email = (raw.get(email_key) or "").strip().lower()
+            dept = ((raw.get(fields["department"]) or "").strip() if "department" in fields else "") or UNSPECIFIED_DEPT
+            uname = ((raw.get(fields["username"]) or "").strip().lower() if "username" in fields else "")
+            if not name:
+                problems.append(f"Row {n}: missing name")
+            elif not is_valid_email(email):
+                problems.append(f"Row {n}: invalid email")
+            elif email in seen:
+                problems.append(f"Row {n}: duplicate email in this file")
+            elif not valid_department(dept):
+                problems.append(f"Row {n}: unknown department")
+            elif uname and (not re.fullmatch(r"[a-z0-9_.-]{3,30}", uname) or uname in RESERVED_USERNAMES):
+                problems.append(f"Row {n}: invalid username")
+            else:
+                seen.add(email)
+                rows.append({"full_name": name, "email": email, "department": dept, "username": uname})
+    except csv.Error:
+        problems.append("The file could not be read as CSV.")
+    return rows, problems
+
+def bulk_import_students(admin_id, rows):
+    """Creates student accounts from parsed CSV rows (full admins only). The accounts have no usable password:
+    each student sets their own with 'Forgot password', which proves they own the email address."""
+    rows = rows[:MAX_IMPORT_ROWS]
+    created = skipped = 0
+    with db_cursor() as c:
+        _require_admin(c, admin_id)
+        c.execute("SELECT LOWER(email) FROM users WHERE LOWER(email) = ANY(%s)", ([r["email"] for r in rows],))
+        existing = {r[0] for r in c.fetchall()}
+        for r in rows:
+            if r["email"] in existing:
+                skipped += 1
+                continue
+            base = r["username"] or re.sub(r"[^a-z0-9_.-]", "", r["email"].split("@")[0])[:24]
+            if len(base) < 3:
+                base = (base + "user")[:24]
+            for attempt in range(60):
+                candidate = base if attempt == 0 else f"{base}{attempt}"[:30]
+                if candidate in RESERVED_USERNAMES:
+                    continue
+                c.execute("INSERT INTO users (username, full_name, email, password_hash, department, email_verified) "
+                          "VALUES (%s, %s, %s, %s, %s, TRUE) ON CONFLICT DO NOTHING RETURNING id",
+                          (candidate, r["full_name"], r["email"], "disabled$" + secrets.token_urlsafe(24), r["department"]))
+                if c.fetchone():
+                    created += 1
+                    break
+            else:
+                skipped += 1
+        _audit(c, admin_id, "bulk_import", f"{created} created, {skipped} skipped")
+    return {"created": created, "skipped": skipped}
+
+def load_roadmap_progress(user_id, sig):
+    """Returns the set of completed task ids ("week_index") saved for a roadmap."""
+    if not re.fullmatch(r"[0-9a-f]{8}", sig or ""):
+        return set()
+    with db_cursor() as c:
+        c.execute("SELECT done_keys FROM roadmap_progress WHERE user_id = %s AND plan_sig = %s", (user_id, sig))
+        row = c.fetchone()
+    return {k for k in (row[0].split(",") if row and row[0] else []) if re.fullmatch(r"[1-4]_\d{1,2}", k)}
+
+def save_roadmap_progress(user_id, sig, done):
+    """Saves completed task ids (validated); keeps only the user's 20 most recent roadmaps."""
+    done = sorted(k for k in done if re.fullmatch(r"[1-4]_\d{1,2}", str(k)))[:60]
+    if not re.fullmatch(r"[0-9a-f]{8}", sig or ""):
+        return False
+    with db_cursor() as c:
+        c.execute("INSERT INTO roadmap_progress (user_id, plan_sig, done_keys) VALUES (%s, %s, %s) "
+                  "ON CONFLICT (user_id, plan_sig) DO UPDATE SET done_keys = EXCLUDED.done_keys, updated_at = now()",
+                  (user_id, sig, ",".join(done)))
+        c.execute("DELETE FROM roadmap_progress WHERE user_id = %s AND plan_sig NOT IN "
+                  "(SELECT plan_sig FROM roadmap_progress WHERE user_id = %s ORDER BY updated_at DESC LIMIT 20)", (user_id, user_id))
+    return True
+
+def authenticate_user(identifier, password):
+    """Verifies credentials; `identifier` is the username OR the registered email.
+    Returns (id, username, full_name, email, created_at) or None.
     Locks the account for LOCKOUT_MINUTES after MAX_LOGIN_FAILURES wrong passwords (raises AccountLocked)."""
-    username = username.strip().lower()
-    if len(password) > MAX_PASSWORD_LEN or len(username) > 64:
+    identifier = identifier.strip().lower()
+    if len(password) > MAX_PASSWORD_LEN or len(identifier) > 254:  # 254 = longest valid email address
         verify_password("x", _dummy_hash())
         return None
     with db_cursor() as c:
         c.execute(
             "SELECT id, username, full_name, email, to_char(created_at, 'YYYY-MM-DD HH24:MI'), password_hash, "
-            "failed_logins, locked_until FROM users WHERE username = %s FOR UPDATE",
-            (username,)
+            "failed_logins, locked_until, email_verified FROM users WHERE username = %s OR LOWER(email) = %s LIMIT 1 FOR UPDATE",
+            (identifier, identifier)  # usernames can't contain "@", so a username never collides with an email
         )
         row = c.fetchone()
         if not row:
@@ -289,7 +666,10 @@ def authenticate_user(username, password):
         c.execute("UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = %s", (row[0],))
         if not row[5].startswith("pbkdf2$") or int(row[5].split("$")[1]) < PBKDF2_ITERATIONS:
             c.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(password), row[0]))
-        return row[:5]
+        profile, unverified = row[:5], not row[8]
+    if unverified:  # raised after the transaction commits, and only once the password has been proven correct
+        raise EmailNotVerified(profile[0])
+    return profile
 
 def get_token_version(user_id):
     """Current session token version for a user (None if the account no longer exists)."""
@@ -568,7 +948,9 @@ def get_admin_metrics(admin_id, days=30, department=None):
     if department is not None and not valid_department(department):
         raise ValueError("Unknown department.")
     with db_cursor() as c:
-        _require_admin(c, admin_id)
+        role, own_department = _require_staff(c, admin_id)
+        if role == "dept_admin":
+            department = own_department  # a department administrator only ever sees their own department
         c.execute(
             "SELECT count(*) FILTER (WHERE role = 'student'), count(*) FILTER (WHERE role = 'admin'), "
             "count(*) FILTER (WHERE role = 'student' AND created_at >= now() - interval '7 days'), "
@@ -595,7 +977,7 @@ def get_admin_metrics(admin_id, days=30, department=None):
         c.execute(
             "SELECT u.department, count(DISTINCT s.user_id), count(*), avg(s.match_score) FROM scans s "
             "JOIN users u ON u.id = s.user_id WHERE u.role = 'student' AND s.scanned_at >= now() - make_interval(days => %s) "
-            "GROUP BY u.department", (days,))
+            "AND (%s::text IS NULL OR u.department = %s) GROUP BY u.department", (days, department, department))
         by_dept = c.fetchall()
         c.execute(
             "SELECT kw, count(*) AS occurrences, count(DISTINCT s.user_id) AS students FROM scans s "
@@ -677,6 +1059,34 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 def session_fields(user_id):
     """Server-side facts stored in the browser session at login (token version, role, department)."""
     return get_session_info(user_id) or {"token_version": -1, "role": "student", "department": UNSPECIFIED_DEPT}
+
+def start_session(user_record):
+    """Signs a user in: stores the profile + fresh server-side facts and resets per-session results."""
+    st.session_state.user = {
+        "id": user_record[0], "username": user_record[1], "full_name": user_record[2],
+        "email": user_record[3], "created_at": user_record[4], **session_fields(user_record[0]),
+    }
+    st.session_state.last_active = time.time()
+    st.session_state.login_at = time.time()
+    st.session_state.last_single_result = None
+    st.session_state.last_batch_result = None
+    st.session_state.last_compare_result = None
+
+def read_cookie(name):
+    """Reads a request cookie (needs Streamlit >= 1.37; returns None if unavailable)."""
+    try:
+        return st.context.cookies.get(name)
+    except Exception:
+        return None
+
+def set_browser_cookie(name, value, max_age):
+    """Sets or clears a cookie through a tiny script (Streamlit has no cookie API). Only token-safe characters are allowed."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{0,100}", value or "") or not re.fullmatch(r"[a-z_]{1,40}", name):
+        return
+    st.components.v1.html(
+        "<script>try{const p=window.parent;const s=p.location.protocol==='https:'?'; Secure':'';"
+        f"p.document.cookie='{name}={value}; max-age={int(max_age)}; path=/; SameSite=Strict'+s;}}catch(e){{}}</script>",
+        height=0)
 
 def jd_picker(prefix, last=None):
     """Role dropdown + job-description box shared by the new pages. Returns (role_title, jd_text)."""
@@ -838,19 +1248,125 @@ def extract_text_from_pdf(uploaded_file):
             if len(text) >= MAX_TEXT_CHARS:
                 text = text[:MAX_TEXT_CHARS]
                 break
-        if not text.strip():
-            return None, "Could not extract text. Please ensure your resume is a text-based PDF and not a scanned image."
+        if len(text.strip()) < 50:
+            return None, ("Could not read any text from this PDF. It looks like a scanned image. Export your resume as a "
+                          "text-based PDF from Word or Google Docs, or upload it as a Word (.docx) file instead.")
         return text, None
     except Exception:
         logger.exception("PDF parsing failed")
         return None, "Could not read this PDF. It may be corrupted or malformed."
 
+MAX_DOCX_XML_BYTES = 10 * 1024 * 1024   # decompressed size cap for word/document.xml (zip-bomb guard)
+WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+def extract_text_from_docx(uploaded_file):
+    """Safely extracts text from a .docx file using only the standard library (size, zip-bomb and XML-entity guards)."""
+    uploaded_file.seek(0, 2)
+    size = uploaded_file.tell()
+    uploaded_file.seek(0)
+    if size > MAX_PDF_BYTES:
+        return None, f"File is too large ({size // 1024} KB). Maximum size is {MAX_PDF_BYTES // (1024 * 1024)} MB."
+    if size == 0 or uploaded_file.read(4) != b"PK\x03\x04":
+        uploaded_file.seek(0)
+        return None, "This file is not a valid Word (.docx) document."
+    uploaded_file.seek(0)
+    try:
+        with zipfile.ZipFile(uploaded_file) as archive:
+            if len(archive.infolist()) > 2000:
+                return None, "This Word file has too many parts to be a normal resume."
+            try:
+                info = archive.getinfo("word/document.xml")
+            except KeyError:
+                return None, "This file is not a valid Word (.docx) document."
+            if info.file_size > MAX_DOCX_XML_BYTES:
+                return None, "This Word document is too large or complex to read."
+            xml_bytes = archive.read(info)  # reading stops at the declared size, so a lying header can't inflate it
+        lowered = xml_bytes.lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:  # blocks XML entity-expansion ("billion laughs") attacks
+            return None, "This Word document contains unsupported content."
+        root = ET.fromstring(xml_bytes)
+        lines = []
+        for paragraph in root.iter(WORD_NS + "p"):
+            line = "".join(node.text or "" for node in paragraph.iter(WORD_NS + "t")).strip()
+            if line:
+                lines.append(line)
+        text = "\n".join(lines)[:MAX_TEXT_CHARS]
+        if len(text.strip()) < 50:
+            return None, "Could not find enough text in this Word document."
+        return text, None
+    except (zipfile.BadZipFile, ET.ParseError):
+        return None, "Could not read this Word file. It may be corrupted."
+    except Exception:
+        logger.exception("DOCX parsing failed")
+        return None, "Could not read this Word file."
+
+def extract_resume_text(uploaded_file):
+    """Reads a resume upload (PDF or Word), choosing the parser from the file's real content, not its name."""
+    head = uploaded_file.read(4)
+    uploaded_file.seek(0)
+    if head == b"PK\x03\x04":
+        return extract_text_from_docx(uploaded_file)
+    return extract_text_from_pdf(uploaded_file)
+
+# Different spellings of the same skill are folded into one token so "ML" and "machine learning" match each other.
+ALIAS_RULES = [
+    (r"c\+\+", "cpp"), (r"c#", "csharp"), (r"\.net", "dotnet"), (r"node\.?\s?js", "nodejs"), (r"react\.?\s?js", "react"),
+    (r"vue\.?\s?js", "vue"), (r"ci\s*[/\s-]\s*cd", "cicd"), (r"scikit[\s-]?learn|sklearn", "scikitlearn"),
+    (r"machine[\s-]+learning|ml", "machinelearning"), (r"deep[\s-]+learning|dl", "deeplearning"),
+    (r"natural[\s-]+language[\s-]+processing", "nlp"), (r"artificial[\s-]+intelligence", "ai"),
+    (r"power[\s-]?bi", "powerbi"), (r"postgre(?:s|sql|\s?sql)", "postgresql"), (r"mongo[\s-]?db", "mongodb"),
+    (r"k8s", "kubernetes"), (r"amazon[\s-]+web[\s-]+services", "aws"), (r"google[\s-]+cloud(?:[\s-]+platform)?", "gcp"),
+    (r"rest(?:ful)?[\s-]+apis?", "restapi"), (r"object[\s-]+oriented[\s-]+programming", "oop"),
+    (r"java[\s-]?script", "javascript"), (r"type[\s-]?script", "typescript"), (r"tensor[\s-]?flow", "tensorflow"),
+]
+# Words that appear in almost every job post but are not skills (kept separate from GENERIC_WORDS so real terms like "data" stay).
+FILLER_WORDS = {
+    "experience", "ability", "strong", "work", "working", "team", "teams", "knowledge", "skills", "skill", "years", "required",
+    "requirements", "preferred", "good", "excellent", "role", "job", "candidate", "candidates", "seeking", "looking", "understanding",
+    "including", "using", "use", "etc", "plus", "must", "will", "new", "high", "based", "related", "environment", "responsibilities",
+    "familiarity", "proficiency", "proficient", "hands", "company", "business", "need", "needs", "needed", "want", "wanted", "able",
+    "like", "ideal", "ideally", "join", "position", "opportunity", "apply", "skilled", "least", "minimum", "degree", "qualifications", "duties",
+}
+DISPLAY_NAMES = {
+    "cpp": "c++", "csharp": "c#", "dotnet": ".net", "nodejs": "node.js", "cicd": "ci-cd", "scikitlearn": "scikit-learn",
+    "machinelearning": "machine learning", "deeplearning": "deep learning", "powerbi": "power bi", "restapi": "rest api",
+}
+
+def normalize_skill_aliases(text):
+    """Replaces known skill spellings (ML, k8s, C++, Node.js ...) with one canonical token."""
+    for pattern, canonical in ALIAS_RULES:
+        text = re.sub(rf"(?<![a-z0-9])(?:{pattern})(?![a-z0-9])", canonical, text)
+    return text
+
+def display_keyword(token):
+    """Human-friendly name for a canonical keyword token."""
+    return DISPLAY_NAMES.get(token, token)
+
 def clean_text(text):
-    """Cleans text by lowercasing and removing special characters."""
-    text = text.lower()
+    """Cleans text: lowercases, folds skill aliases together and removes special characters."""
+    text = normalize_skill_aliases(text.lower())
     text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+def ats_format_checks(text):
+    """Heuristic layout checks on the extracted text: things that commonly trip up real applicant tracking systems."""
+    text = (text or "")[:MAX_TEXT_CHARS]
+    words = len(text.split())
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    checks = []
+    checks.append({"label": "Length (one to two pages)", "ok": 250 <= words <= 1000,
+                   "tip": f"Your resume has {words} words. Aim for roughly 250-1000 words (1-2 pages)."})
+    table_like = ("\t" in text) or sum(1 for ln in lines if re.search(r"\S {4,}\S", ln) or ln.count("|") >= 2) >= 3
+    checks.append({"label": "Simple single-column layout", "ok": not table_like,
+                   "tip": "Tabs, wide gaps or '|' separators suggest tables or columns. Many ATS read these in the wrong order. Use one column."})
+    symbols = len(re.findall(r"[\u2190-\u2BFF\u2600-\u27BF\U0001F300-\U0001FAFF]", text))
+    checks.append({"label": "No decorative symbols or icons", "ok": symbols <= 3,
+                   "tip": "Icons, stars and arrows often turn into garbage characters. Use plain text and simple '-' or '•' bullets."})
+    avg_len = (sum(len(ln) for ln in lines) / len(lines)) if lines else 0
+    checks.append({"label": "Short scannable lines", "ok": avg_len <= 140 or len(lines) < 5,
+                   "tip": "Long paragraphs are hard to scan. Break experience into short bullet points."})
+    return checks
 
 def extract_contact_and_sections(raw_text):
     """Checks for essential ATS contact info, standard resume sections, action verbs, and metrics."""
@@ -899,9 +1415,10 @@ def calculate_similarity(resume_text, jd_text):
 def analyze_keywords(resume_text, jd_text):
     """Extracts top keywords from JD and compares frequency safely."""
     try:
-        tfidf = TfidfVectorizer(stop_words='english', max_features=20)
+        tfidf = TfidfVectorizer(stop_words='english', max_features=40)
         tfidf.fit([jd_text])
-        top_keywords = list(tfidf.get_feature_names_out())
+        # generic filler words ("ability", "team", "experience") are not skills: drop them and keep the top 20 real ones
+        top_keywords = [w for w in tfidf.get_feature_names_out() if w not in FILLER_WORDS][:20]
     except ValueError:
         return [], [], pd.DataFrame()
 
@@ -915,12 +1432,13 @@ def analyze_keywords(resume_text, jd_text):
     for kw in sorted(top_keywords):
         jd_count = jd_words.count(kw)
         res_count = resume_words.count(kw)
+        shown = display_keyword(kw)
         if res_count == 0:
-            missing.append(kw)
+            missing.append(shown)
         else:
-            matched.append(kw)
+            matched.append(shown)
         chart_data.append({
-            "Keyword": kw,
+            "Keyword": shown,
             "Job Description": jd_count,
             "Your Resume": res_count
         })
@@ -1219,6 +1737,17 @@ def is_valid_email(email):
 # AUTHENTICATION VIEW (LOGIN / SIGN UP / FORGOT PASSWORD)
 # =========================================================
 if st.session_state.user is None:
+    if st.session_state.pop("clear_cookie", False):
+        set_browser_cookie(REMEMBER_COOKIE, "", 0)
+    if not st.session_state.get("remember_checked"):  # one attempt per browser session, so it can never loop
+        st.session_state.remember_checked = True
+        _token = read_cookie(REMEMBER_COOKIE)
+        if _token:
+            _record = user_from_remember_token(_token)
+            if _record:
+                start_session(_record)
+                st.rerun()
+            set_browser_cookie(REMEMBER_COOKIE, "", 0)  # stale or revoked cookie: remove it
     hero("📄 AI ATS Resume Analyzer", "Beat the applicant tracking system. Score your resume, close skill gaps and prep for interviews.")
     f1, f2, f3, f4 = st.columns(4)
     for col, (ttl, desc) in zip([f1, f2, f3, f4], [
@@ -1234,38 +1763,57 @@ if st.session_state.user is None:
 
     auth_col1, auth_col2, auth_col3 = st.columns([1, 2, 1])
     with auth_col2:
-        login_tab, register_tab = st.tabs(["🔐 Login", "📝 Create Account"])
+        AUTH_LOGIN, AUTH_REGISTER = "🔐 Login", "📝 Create Account"
+        if st.session_state.get("auth_goto"):  # set by a successful sign-up; applied before the widget is created
+            st.session_state.auth_view = st.session_state.pop("auth_goto")
+        auth_view = st.radio("Account", [AUTH_LOGIN, AUTH_REGISTER], horizontal=True,
+                             label_visibility="collapsed", key="auth_view")
 
-        with login_tab:
-            if not st.session_state.show_forgot:
+        if auth_view == AUTH_LOGIN:
+            if st.session_state.get("verify_user_id"):
+                st.markdown("#### 📧 Verify your email")
+                st.caption(f"Enter the 6-digit code we emailed you. It expires in {VERIFY_CODE_MINUTES} minutes.")
+                with st.form("verify_email_form"):
+                    verify_code_in = st.text_input("Verification code", max_chars=6)
+                    if st.form_submit_button("Verify email", use_container_width=True, type="primary"):
+                        if verify_email_code(st.session_state.verify_user_id, verify_code_in):
+                            st.session_state.verify_user_id = None
+                            st.session_state.signup_notice = "Email verified! Please log in."
+                            st.rerun()
+                        else:
+                            st.error("Invalid or expired code.")
+                v1, v2 = st.columns(2)
+                if v1.button("Resend code", use_container_width=True):
+                    send_verification_code(st.session_state.verify_user_id)
+                    st.info("If a new code can be sent, it is on its way.")
+                if v2.button("← Back to login", use_container_width=True, key="close_verify"):
+                    st.session_state.verify_user_id = None
+                    st.rerun()
+            elif not st.session_state.show_forgot:
+                if st.session_state.get("signup_notice"):
+                    st.success(st.session_state.pop("signup_notice"))
                 with st.form("login_form"):
-                    login_username = st.text_input("Username")
+                    login_username = st.text_input("Username or Email", value=st.session_state.pop("login_prefill", ""))
                     login_password = st.text_input("Password", type="password", max_chars=MAX_PASSWORD_LEN)
+                    keep_signed_in = st.checkbox(f"Keep me signed in on this device ({REMEMBER_DAYS} days)")
                     login_submitted = st.form_submit_button("Login", use_container_width=True, type="primary")
 
                     if login_submitted:
                         if not login_username or not login_password:
-                            st.warning("Please enter both username and password.")
+                            st.warning("Please enter your username or email, and your password.")
                         else:
                             try:
                                 user_record = authenticate_user(login_username, login_password)
                             except AccountLocked:
                                 st.error(LOGIN_FAILED_MSG)  # identical text to a wrong password: a lock must not reveal the account exists
                                 st.stop()
+                            except EmailNotVerified as unverified:
+                                st.session_state.verify_user_id = unverified.user_id  # only reachable with the right password
+                                st.rerun()
                             if user_record:
-                                st.session_state.user = {
-                                    "id": user_record[0],
-                                    "username": user_record[1],
-                                    "full_name": user_record[2],
-                                    "email": user_record[3],
-                                    "created_at": user_record[4],
-                                    **session_fields(user_record[0])
-                                }
-                                st.session_state.last_active = time.time()
-                                st.session_state.login_at = time.time()
-                                st.session_state.last_single_result = None
-                                st.session_state.last_batch_result = None
-                                st.session_state.last_compare_result = None
+                                start_session(user_record)
+                                if keep_signed_in:
+                                    st.session_state.pending_cookie = create_remember_token(user_record[0])
                                 st.rerun()
                             else:
                                 st.error(LOGIN_FAILED_MSG)
@@ -1319,7 +1867,7 @@ if st.session_state.user is None:
                                 else:
                                     st.error(msg)
 
-        with register_tab:
+        else:
             with st.form("register_form"):
                 reg_full_name = st.text_input("Full Name (e.g., Aarav Sharma)", max_chars=MAX_NAME_LEN)
                 reg_username = st.text_input("Choose a Username", max_chars=30)
@@ -1341,7 +1889,10 @@ if st.session_state.user is None:
                     else:
                         success, msg = register_user(reg_username, reg_full_name, reg_email, reg_password, reg_dept)
                         if success:
-                            st.success(msg)
+                            st.session_state.auth_goto = AUTH_LOGIN  # take the new user straight to the login page
+                            st.session_state.signup_notice = msg
+                            st.session_state.login_prefill = reg_username.strip().lower()
+                            st.rerun()
                         else:
                             st.error(msg)
 
@@ -1353,6 +1904,8 @@ if st.session_state.user is None:
 # =========================================================
 else:
     user = st.session_state.user
+    if st.session_state.get("pending_cookie"):
+        set_browser_cookie(REMEMBER_COOKIE, st.session_state.pop("pending_cookie"), REMEMBER_DAYS * 86400)
 
     # Sign out on idle timeout, deleted account, or after a password change/reset elsewhere.
     session_info = get_session_info(user["id"])
@@ -1390,7 +1943,7 @@ else:
             "🕒 My Scan History & Trends",
             "⚙️ Account & Security",
         ]
-        if user.get("role") == "admin":
+        if user.get("role") in ("admin", "dept_admin"):
             nav_options.append("📊 Admin Analytics")
         nav_page = st.radio("Navigation", nav_options)
 
@@ -1403,6 +1956,10 @@ else:
 
         st.divider()
         if st.button("🚪 Logout", use_container_width=True):
+            _token = read_cookie(REMEMBER_COOKIE)
+            if _token:
+                revoke_remember_token(_token)
+            st.session_state.clear_cookie = True
             st.session_state.user = None
             st.session_state.last_single_result = None
             st.session_state.last_batch_result = None
@@ -1419,8 +1976,8 @@ else:
         col1, col2 = st.columns(2)
 
         with col1:
-            step_header(1, "Upload Resume (PDF)")
-            uploaded_resume = st.file_uploader("Choose a PDF file", type=["pdf"])
+            step_header(1, "Upload Resume (PDF or Word)")
+            uploaded_resume = st.file_uploader("Choose a PDF or Word (.docx) file", type=["pdf", "docx"])
 
         with col2:
             step_header(2, "Target Role / Job Description")
@@ -1439,7 +1996,7 @@ else:
             elif uploaded_resume is not None and job_description.strip() != "":
                 with st.spinner("Running NLP analysis, impact audit & interview generator..."):
                     resume_name = safe_filename(uploaded_resume.name)
-                    raw_resume, pdf_error = extract_text_from_pdf(uploaded_resume)
+                    raw_resume, pdf_error = extract_resume_text(uploaded_resume)
                     if pdf_error:
                         st.error(pdf_error)
                     else:
@@ -1556,6 +2113,13 @@ else:
                 else:
                     st.warning("No strong action verbs detected. Start bullet points with words like *Developed, Engineered, Optimized, Deployed*.")
 
+                st.divider()
+                st.markdown("#### 🧾 ATS Format Check")
+                for check in ats_format_checks(res.get("raw_text", "")):
+                    st.markdown(pill(check["label"], check["ok"], "Looks good", "Needs attention"), unsafe_allow_html=True)
+                    if not check["ok"]:
+                        st.caption(check["tip"])
+
             with tab4:
                 st.markdown(f"#### 🎤 Tailored Interview Questions for **{res['role_title']}**")
                 st.caption("Generated dynamically from your matched strengths and skill gaps:")
@@ -1598,8 +2162,8 @@ else:
             key="batch_jd"
         )
         uploaded_files = st.file_uploader(
-            "Upload Multiple Resumes (PDF)",
-            type=["pdf"],
+            "Upload Multiple Resumes (PDF or Word)",
+            type=["pdf", "docx"],
             accept_multiple_files=True
         )
 
@@ -1619,7 +2183,7 @@ else:
                     with st.spinner(f"Evaluating {len(uploaded_files)} resumes..."):
                         for file in uploaded_files:
                             display_name = safe_filename(file.name)
-                            raw_text, err = extract_text_from_pdf(file)
+                            raw_text, err = extract_resume_text(file)
                             if err:
                                 results.append({
                                     "Candidate Resume": display_name,
@@ -1777,6 +2341,29 @@ else:
                         else:
                             st.error(msg)
 
+        st.divider()
+        with st.expander("🗑️ Delete my account"):
+            st.warning("This permanently deletes your account, scan history and saved progress. It cannot be undone.")
+            with st.form("delete_account_form"):
+                del_pw = st.text_input("Confirm with your password", type="password", max_chars=MAX_PASSWORD_LEN)
+                del_confirm = st.text_input("Type DELETE to confirm", max_chars=10)
+                if st.form_submit_button("Permanently delete my account", use_container_width=True):
+                    if del_confirm.strip() != "DELETE" or not del_pw:
+                        st.warning("Enter your password and type DELETE to confirm.")
+                    else:
+                        ok, msg = delete_user_account(user["id"], del_pw)
+                        if ok:
+                            st.session_state.user = None
+                            st.session_state.last_single_result = None
+                            st.session_state.last_batch_result = None
+                            st.session_state.last_compare_result = None
+                            wipe_work_state()
+                            st.session_state.clear_cookie = True
+                            st.session_state.session_notice = msg
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
     # ---------------------------------------------------------
     # PAGE: RESUME A/B COMPARISON
     # ---------------------------------------------------------
@@ -1787,10 +2374,10 @@ else:
         col_a, col_b = st.columns(2)
         with col_a:
             step_header("A", "Older version")
-            ab_file_a = st.file_uploader("Resume version A (PDF)", type=["pdf"], key="ab_file_a")
+            ab_file_a = st.file_uploader("Resume version A (PDF or Word)", type=["pdf", "docx"], key="ab_file_a")
         with col_b:
             step_header("B", "Newer version")
-            ab_file_b = st.file_uploader("Resume version B (PDF)", type=["pdf"], key="ab_file_b")
+            ab_file_b = st.file_uploader("Resume version B (PDF or Word)", type=["pdf", "docx"], key="ab_file_b")
 
         if st.button("Compare Versions 🔀", use_container_width=True, type="primary"):
             if analysis_quota_remaining(user["id"]) < 2:
@@ -1801,8 +2388,8 @@ else:
                 st.warning("Please enter meaningful text in the job description.")
             else:
                 with st.spinner("Comparing both versions..."):
-                    text_a, err_a = extract_text_from_pdf(ab_file_a)
-                    text_b, err_b = (None, None) if err_a else extract_text_from_pdf(ab_file_b)
+                    text_a, err_a = extract_resume_text(ab_file_a)
+                    text_b, err_b = (None, None) if err_a else extract_resume_text(ab_file_b)
                     if err_a:
                         st.error(f"Version A: {err_a}")
                     elif err_b:
@@ -1978,7 +2565,13 @@ else:
         if not roadmap:
             st.info("No skill gaps to plan for yet. Run an analysis first, or type the skills you want to learn.")
         else:
-            sig = hashlib.sha256((",".join(sk for w in roadmap for sk in w["skills"]) + str(hours)).encode()).hexdigest()[:8]
+            sig = hashlib.sha256(",".join(sk for w in roadmap for sk in w["skills"]).encode()).hexdigest()[:8]
+            if st.session_state.get("rm_loaded") != (user["id"], sig):  # first time this plan is shown: restore saved ticks
+                saved_ids = load_roadmap_progress(user["id"], sig)
+                for w in roadmap:
+                    for i in range(len(w["tasks"])):
+                        st.session_state[f"rm_{sig}_{w['week']}_{i}"] = f"{w['week']}_{i}" in saved_ids
+                st.session_state.rm_loaded, st.session_state.rm_saved = (user["id"], sig), saved_ids
             keys = [f"rm_{sig}_{w['week']}_{i}" for w in roadmap for i in range(len(w["tasks"]))]
             done = sum(1 for k in keys if st.session_state.get(k))
             st.progress(done / len(keys), text=f"{done} of {len(keys)} tasks done")
@@ -1987,21 +2580,29 @@ else:
                     for i, task in enumerate(w["tasks"]):
                         st.checkbox(task, key=f"rm_{sig}_{w['week']}_{i}")
                     st.info(f"💡 **Project idea:** {w['project']}")
+            now_done = {f"{w['week']}_{i}" for w in roadmap for i in range(len(w["tasks"])) if st.session_state.get(f"rm_{sig}_{w['week']}_{i}")}
+            if now_done != st.session_state.get("rm_saved"):
+                save_roadmap_progress(user["id"], sig, now_done)
+                st.session_state.rm_saved = now_done
             st.download_button("📥 Download checklist (.txt)", roadmap_to_text(roadmap, clean_line(rm_role, 80)),
                                file_name="30_day_skill_roadmap.txt", mime="text/plain")
-            st.caption("Tick tasks as you go. Progress lasts for this session; download the checklist to keep it.")
+            st.caption("Tick tasks as you go. Your progress is saved to your account automatically.")
 
     # ---------------------------------------------------------
     # PAGE: ADMIN ANALYTICS (administrators only)
     # ---------------------------------------------------------
     elif nav_page == "📊 Admin Analytics":
         hero("📊 Admin Analytics", "Platform-wide, anonymised insight into how students are doing.")
-        if user.get("role") != "admin":
+        if user.get("role") not in ("admin", "dept_admin"):
             st.error("Administrator access required.")
             st.stop()
         f1, f2 = st.columns(2)
         days = f1.selectbox("Reporting window", list(ADMIN_WINDOWS), index=1, format_func=lambda d: f"Last {d} days")
-        dept_choice = f2.selectbox("Department", ["All departments", UNSPECIFIED_DEPT] + DEPARTMENTS)
+        if user.get("role") == "dept_admin":
+            dept_choice = user.get("department")
+            f2.info(f"Your view is limited to: {dept_choice}")
+        else:
+            dept_choice = f2.selectbox("Department", ["All departments", UNSPECIFIED_DEPT] + DEPARTMENTS)
         try:
             m = get_admin_metrics(user["id"], days, None if dept_choice == "All departments" else dept_choice)
         except PermissionError:
@@ -2054,3 +2655,34 @@ else:
                     st.caption("No scans in this window.")
         st.caption("🔒 Aggregate data only: no names, emails or resume content are shown, and groups smaller than "
                    f"{K_ANON_MIN_GROUP} students are hidden or merged.")
+
+        if user.get("role") == "admin":
+            st.divider()
+            st.subheader("👥 Staff roles")
+            st.dataframe(pd.DataFrame(list_staff(user["id"])), use_container_width=True, hide_index=True)
+            with st.form("role_form"):
+                r1, r2 = st.columns(2)
+                role_username = r1.text_input("Username", max_chars=30)
+                role_new = r2.selectbox("New role", list(ROLES), format_func=lambda r: {"student": "Student", "dept_admin": "Department admin (own department only)", "admin": "Administrator"}[r])
+                if st.form_submit_button("Apply role", use_container_width=True):
+                    ok, msg = set_user_role(user["id"], role_username, role_new)
+                    (st.success if ok else st.error)(msg)
+
+            st.subheader("📥 Import students (CSV)")
+            st.caption("Columns: full_name (or name), email. Optional: department, username. Imported students have no password: "
+                       "they open **Forgot password** and set their own, which proves they own the email address.")
+            st.download_button("Download CSV template", "full_name,email,department\nAarav Sharma,aarav@example.com,Computer Science\n",
+                               file_name="students_template.csv", mime="text/csv")
+            csv_file = st.file_uploader("Student list", type=["csv"], key="import_csv")
+            if csv_file is not None:
+                import_rows, import_problems = parse_student_csv(csv_file.getvalue().decode("utf-8", "ignore"))
+                st.write(f"**{len(import_rows)}** valid row(s), **{len(import_problems)}** problem(s).")
+                for problem in import_problems[:10]:
+                    st.caption(f"• {problem}")
+                if import_rows and st.button(f"Import {len(import_rows)} students", type="primary", use_container_width=True):
+                    with st.spinner("Creating accounts..."):
+                        result = bulk_import_students(user["id"], import_rows)
+                    st.success(f"Created {result['created']} account(s); skipped {result['skipped']} (already registered).")
+
+            with st.expander("🧾 Recent admin activity"):
+                st.dataframe(pd.DataFrame(list_audit_log(user["id"])), use_container_width=True, hide_index=True)

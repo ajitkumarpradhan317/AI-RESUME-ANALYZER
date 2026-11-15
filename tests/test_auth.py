@@ -84,9 +84,9 @@ class AuthenticateTests(unittest.TestCase):
     def setUp(self):
         self.ns = load_app()
 
-    def row(self, pw=PW, failures=0, locked_until=None, stored=None):
+    def row(self, pw=PW, failures=0, locked_until=None, stored=None, verified=True):
         return (7, "aarav.s", "Aarav", "a@example.com", "2026-01-01 10:00",
-                stored or self.ns["hash_password"](pw), failures, locked_until)
+                stored or self.ns["hash_password"](pw), failures, locked_until, verified)
 
     def login(self, row, password=PW, username=" Aarav.S "):
         cur = use_cursor(self.ns, FakeCursor(fetchone=[row] if row else []))
@@ -95,8 +95,25 @@ class AuthenticateTests(unittest.TestCase):
     def test_valid_login_returns_profile_and_resets_counter(self):
         user, cur = self.login(self.row(failures=3))
         self.assertEqual(user, (7, "aarav.s", "Aarav", "a@example.com", "2026-01-01 10:00"))
-        self.assertEqual(cur.executed[0][1], ("aarav.s",))
+        self.assertEqual(cur.executed[0][1], ("aarav.s", "aarav.s"))
         self.assertTrue(cur.statements("failed_logins = 0, locked_until = NULL"))
+
+    def test_login_works_with_email_in_any_case_and_with_spaces(self):
+        user, cur = self.login(self.row(), username="  Aarav@Example.COM ")
+        self.assertEqual(user[1], "aarav.s")
+        sql, params = cur.executed[0]
+        self.assertIn("username = %s OR LOWER(email) = %s", sql)
+        self.assertEqual(params, ("aarav@example.com", "aarav@example.com"))
+
+    def test_wrong_password_by_email_counts_against_the_same_account(self):
+        user, cur = self.login(self.row(failures=4), username="aarav@example.com", password="bad")
+        self.assertIsNone(user)
+        self.assertTrue(cur.statements("locked_until = %s"))  # 5th failure via email locks the account too
+
+    def test_long_valid_email_is_accepted(self):
+        long_email = "a" * 64 + "@" + "b" * 63 + ".com"
+        user, cur = self.login(self.row(), username=long_email)
+        self.assertIsNotNone(user)
 
     def test_wrong_password_counts_failure(self):
         user, cur = self.login(self.row(failures=1), password="bad")
@@ -136,7 +153,7 @@ class AuthenticateTests(unittest.TestCase):
 
     def test_oversized_inputs_short_circuit(self):
         cur = use_cursor(self.ns, FakeCursor())
-        self.assertIsNone(self.ns["authenticate_user"]("u" * 65, "x"))
+        self.assertIsNone(self.ns["authenticate_user"]("u" * 300, "x"))
         self.assertIsNone(self.ns["authenticate_user"]("user", "x" * 5000))
         self.assertEqual(cur.executed, [])
 

@@ -10,7 +10,7 @@ class TextAnalysisTests(unittest.TestCase):
         self.ns = load_app()
 
     def test_clean_text(self):
-        self.assertEqual(self.ns["clean_text"]("  Hello,   WORLD!! C++/Node.js "), "hello world c node js")
+        self.assertEqual(self.ns["clean_text"]("  Hello,   WORLD!! C++/Node.js "), "hello world cpp nodejs")  # aliases folded, nothing lost
 
     def test_is_valid_email(self):
         ok = self.ns["is_valid_email"]

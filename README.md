@@ -57,6 +57,30 @@ The role is re-read from the database on every page load and inside every analyt
 ### Student privacy in the admin dashboard
 Aggregate data only: no names, emails, file names or resume text are ever returned. Administrators' own scans are excluded. Any view covering fewer than 3 active students is suppressed (including a department filter that would single out one or two students), departments with fewer than 3 students are merged into "Other departments" (or hidden), and a skill is listed only if at least 3 different students are missing it.
 
+### Accounts and sign-in
+- **Email verification at sign-up** (on automatically when Brevo is configured; `REQUIRE_EMAIL_VERIFICATION=false` turns it off). A 6-digit code is emailed; accounts must verify before they can log in. A never-verified sign-up cannot block the real owner of an email address.
+- **Keep me signed in** (14 days) via a random token stored hashed in the database; it is revoked on logout, password change/reset and account deletion.
+- **Delete my account** on the Account page: removes the account and all its data (scans, saved roadmap progress, codes, tokens). The last administrator cannot delete themselves.
+- Uploads: **PDF or Word (.docx)**. Scanned-image PDFs get a clear message explaining what to do.
+- **Smarter keyword matching:** `ML` = `machine learning`, `k8s` = `Kubernetes`, `C++`, `Node.js`, `CI/CD` etc. are treated as one skill, and generic filler words ("ability", "team") are no longer reported as missing skills.
+- **ATS format check** in the audit tab (length, tables/columns, decorative symbols, wall-of-text lines).
+
+### Administration
+- **Roles:** `student`, `dept_admin` (sees analytics for their own department only) and `admin`. Admins manage roles from the Admin Analytics page (every change is written to an audit log; the last admin can never be removed).
+- **Bulk import:** upload a CSV (`full_name,email,department`). Imported students have no password: they use **Forgot password**, which proves they own the email. Max 300 rows per file.
+
+## Configuration reference
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | yes | Supabase **Session pooler** connection string |
+| `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | for email | password-reset and verification emails (sender must be verified in Brevo) |
+| `OTP_PEPPER` | recommended | long random secret for hashing codes and tokens (`render.yaml` generates one) |
+| `REQUIRE_EMAIL_VERIFICATION` | no | `false` disables sign-up verification (default: on when Brevo is configured) |
+| `DB_SSLMODE` | no | `disable` only for a local Docker Postgres |
+| `SKIP_DB_INIT` | no | `true` once the schema exists, so a limited database role can be used |
+
+More: **docs/DEPLOYMENT.md** (Render, backups, least-privilege role), **docs/ARCHITECTURE.md**, **docs/LIMITATIONS.md**, **docs/MANUAL_TEST_CHECKLIST.md**.
+
 ## Running the Unit Tests
 The tests need no database, Brevo account or Streamlit server (they use fakes and mocks):
 ```bash
@@ -98,11 +122,5 @@ Penetration-test findings and the controls in place. Run `python -m unittest dis
 - Sign-up still reveals that a username or email is taken, and emails are not verified at sign-up (someone can register with another person's address). Email verification is the proper fix.
 - Per-account lockout means an attacker who knows a username can lock that user out for 15 minutes. Put Cloudflare / a WAF with IP rate limiting in front of Render to blunt this and credential stuffing.
 - Streamlit cannot set HTTP security headers (CSP, X-Frame-Options); set them at the proxy/CDN.
-- Use a dedicated least-privilege database role instead of the Supabase `postgres` superuser:
-  ```sql
-  CREATE ROLE ats_app LOGIN PASSWORD '...';
-  GRANT USAGE ON SCHEMA public TO ats_app;
-  GRANT SELECT, INSERT, UPDATE, DELETE ON users, password_resets, scans TO ats_app;
-  ```
-  (the app creates the tables itself, so run it once as the owner first.)
+- Use a dedicated least-privilege database role instead of the Supabase `postgres` superuser (see **docs/DEPLOYMENT.md**).
 - Set `OTP_PEPPER` to a long random string so stored OTP digests don't depend on the database password.

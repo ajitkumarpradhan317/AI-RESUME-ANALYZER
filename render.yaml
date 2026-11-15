@@ -2,15 +2,20 @@ services:
   - type: web
     name: ai-ats-resume-analyzer
     runtime: python
-    plan: free
+    plan: free                      # free services sleep after ~15 min idle; use "starter" for always-on (see docs/DEPLOYMENT.md)
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    healthCheckPath: /_stcore/health
     envVars:
-      - key: DATABASE_URL
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DATABASE_URL            # Supabase "Session pooler" connection string
         sync: false
       - key: BREVO_API_KEY
         sync: false
-      - key: BREVO_SENDER_EMAIL
+      - key: BREVO_SENDER_EMAIL      # must be a verified sender in Brevo
         sync: false
       - key: BREVO_SENDER_NAME
         value: AI ATS Resume Analyzer
+      - key: OTP_PEPPER              # secret used to hash one-time codes and login tokens; generated for you
+        generateValue: true

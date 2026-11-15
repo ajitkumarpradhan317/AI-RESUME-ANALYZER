@@ -42,7 +42,8 @@ class UiFlowTests(SchemaTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.env = mock.patch.dict(os.environ, {
-            "DATABASE_URL": cls.url, "BREVO_API_KEY": "test-key", "BREVO_SENDER_EMAIL": "from@example.com"})
+            "DATABASE_URL": cls.url, "BREVO_API_KEY": "test-key", "BREVO_SENDER_EMAIL": "from@example.com",
+            "REQUIRE_EMAIL_VERIFICATION": "false"})  # verification has its own tests below
         cls.env.start()
         st.cache_resource.clear()  # force init_db to create tables in this schema
 
@@ -68,6 +69,8 @@ class UiFlowTests(SchemaTestCase):
         return at
 
     def sign_up(self, at, pw=PW):
+        if widget(at, "radio", "Account").value != "📝 Create Account":
+            widget(at, "radio", "Account").set_value("📝 Create Account").run()
         widget(at, "text_input", "Full Name (e.g., Aarav Sharma)").set_value("Aarav Sharma")
         widget(at, "text_input", "Choose a Username").set_value("aarav.s")
         widget(at, "text_input", "Email Address").set_value("aarav@example.com")
@@ -76,8 +79,8 @@ class UiFlowTests(SchemaTestCase):
         widget(at, "button", "Register Account").click().run()
         return at
 
-    def log_in(self, at, pw=PW):
-        widget(at, "text_input", "Username").set_value("aarav.s")
+    def log_in(self, at, pw=PW, identifier="aarav.s"):
+        widget(at, "text_input", "Username or Email").set_value(identifier)
         widget(at, "text_input", "Password").set_value(pw)
         widget(at, "button", "Login").click().run()
         return at
@@ -89,9 +92,10 @@ class UiFlowTests(SchemaTestCase):
             time.sleep(0.05)
         self.assertGreaterEqual(len(self.emails), count, "reset email was never sent")
 
-    def test_login_screen_shows_two_tabs_and_forgot_link(self):
+    def test_login_screen_shows_two_views_and_forgot_link(self):
         at = self.app()
-        self.assertEqual([t.label for t in at.tabs], ["🔐 Login", "📝 Create Account"])  # no separate forgot tab
+        self.assertEqual(list(widget(at, "radio", "Account").options), ["🔐 Login", "📝 Create Account"])  # no separate forgot view
+        self.assertEqual(widget(at, "radio", "Account").value, "🔐 Login")
         widget(at, "button", "🔑 Forgot password?")
 
     def test_signup_then_login_reaches_dashboard(self):
@@ -101,10 +105,31 @@ class UiFlowTests(SchemaTestCase):
         self.assertFalse(at.exception)
         self.assertEqual(at.session_state["user"]["username"], "aarav.s")
 
+    def test_successful_signup_goes_straight_to_the_login_page(self):
+        at = self.sign_up(self.app())
+        self.assertFalse(at.exception, at.exception)
+        self.assertEqual(widget(at, "radio", "Account").value, "🔐 Login")               # switched automatically
+        self.assertTrue(any("Account created" in e.value for e in at.success))          # confirmation shown on the login page
+        self.assertEqual(widget(at, "text_input", "Username or Email").value, "aarav.s")  # username pre-filled
+        at = self.log_in(at)                                                              # only the password is left to type
+        self.assertEqual(at.session_state["user"]["username"], "aarav.s")
+
+    def test_failed_signup_stays_on_the_register_page(self):
+        self.sign_up(self.app())
+        at = self.sign_up(self.app())  # duplicate
+        self.assertEqual(widget(at, "radio", "Account").value, "📝 Create Account")
+        self.assertTrue(at.error)
+
+    def test_login_with_email_works_in_the_ui(self):
+        self.sign_up(self.app())
+        for identifier in ("aarav@example.com", "AARAV@Example.com", "aarav.s"):
+            at = self.log_in(self.app(), identifier=identifier)
+            self.assertEqual(at.session_state["user"]["username"], "aarav.s", identifier)
+
     def test_wrong_password_shows_error_and_stays_logged_out(self):
         self.sign_up(self.app())
         at = self.log_in(self.app(), pw="wrongpass1")
-        self.assertTrue(any(e.value.startswith("Invalid username or password.") for e in at.error))
+        self.assertTrue(any(e.value.startswith("Invalid username/email or password.") for e in at.error))
         self.assertIsNone(at.session_state["user"])
 
     def test_duplicate_signup_is_rejected_in_ui(self):
@@ -154,7 +179,7 @@ class UiFlowTests(SchemaTestCase):
         self.sign_up(self.app())
         def failed_login(username, pw):
             at = self.app()
-            widget(at, "text_input", "Username").set_value(username)
+            widget(at, "text_input", "Username or Email").set_value(username)
             widget(at, "text_input", "Password").set_value(pw)
             widget(at, "button", "Login").click().run()
             self.assertIsNone(at.session_state["user"])
@@ -184,6 +209,7 @@ class UiFlowTests(SchemaTestCase):
 
     def test_reserved_and_weak_credentials_are_rejected_in_the_ui(self):
         at = self.app()
+        widget(at, "radio", "Account").set_value("📝 Create Account").run()
         widget(at, "text_input", "Full Name (e.g., Aarav Sharma)").set_value("Mallory")
         widget(at, "text_input", "Choose a Username").set_value("admin")
         widget(at, "text_input", "Email Address").set_value("m@example.com")
@@ -241,6 +267,7 @@ class UiFlowTests(SchemaTestCase):
 
     def test_signup_with_department_and_roadmap_from_typed_skills(self):
         at = self.app()
+        widget(at, "radio", "Account").set_value("📝 Create Account").run()
         widget(at, "selectbox", "Department").set_value("Computer Science")
         self.sign_up(at)
         self.assertEqual(self.sql("SELECT department FROM users")[0][0], "Computer Science")
@@ -259,6 +286,64 @@ class UiFlowTests(SchemaTestCase):
             "- Worked on websites for clients\n- Responsible for managing the database backups").run()
         self.assertFalse(at.exception, at.exception)
         self.assertTrue(any("Bullet" in e.label for e in at.expander))  # weak bullets are flagged live
+
+    # ---- upgrades ---------------------------------------------------------------
+    def test_email_verification_screen_end_to_end(self):
+        with mock.patch.dict(os.environ, {"REQUIRE_EMAIL_VERIFICATION": "true"}):
+            self.sign_up(self.app())
+            self.wait_for_email()
+            code = re.search(r">\s*(\d{6})\s*<", self.emails[0]["htmlContent"]).group(1)
+            self.assertEqual(self.emails[0]["to"][0]["email"], "aarav@example.com")
+            at = self.log_in(self.app())                                      # correct password, unverified email
+            self.assertIsNone(at.session_state["user"])
+            widget(at, "text_input", "Verification code").set_value("000000" if code != "000000" else "111111")
+            widget(at, "button", "Verify email").click().run()
+            self.assertTrue(any("Invalid or expired" in e.value for e in at.error))
+            widget(at, "text_input", "Verification code").set_value(code)
+            widget(at, "button", "Verify email").click().run()
+            self.assertTrue(any("Email verified" in e.value for e in at.success))
+            at = self.log_in(at)
+            self.assertEqual(at.session_state["user"]["username"], "aarav.s")
+
+    def test_delete_account_from_the_account_page(self):
+        self.sign_up(self.app())
+        at = self.log_in(self.app())
+        self.nav(at).set_value("⚙️ Account & Security").run()
+        widget(at, "text_input", "Confirm with your password").set_value("wrong-pass")
+        widget(at, "text_input", "Type DELETE to confirm").set_value("DELETE")
+        widget(at, "button", "Permanently delete my account").click().run()
+        self.assertEqual(self.sql("SELECT count(*) FROM users")[0][0], 1)             # wrong password: account survives
+        widget(at, "text_input", "Confirm with your password").set_value(PW)
+        widget(at, "button", "Permanently delete my account").click().run()
+        self.assertEqual(self.sql("SELECT count(*) FROM users")[0][0], 0)
+        self.assertIsNone(at.session_state["user"])
+
+    def test_department_admin_page_is_limited_to_their_department(self):
+        at = self.app()
+        widget(at, "radio", "Account").set_value("📝 Create Account").run()
+        widget(at, "selectbox", "Department").set_value("Civil")
+        self.sign_up(at)
+        self.sql("UPDATE users SET role = 'dept_admin'")
+        at = self.log_in(self.app())
+        self.assertIn("📊 Admin Analytics", self.nav(at).options)
+        self.nav(at).set_value("📊 Admin Analytics").run()
+        self.assertFalse(at.exception, at.exception)
+        self.assertTrue(any("limited to: Civil" in e.value for e in at.info))
+        self.assertFalse(any(b.label == "Apply role" for b in at.button))             # no staff-management tools for dept admins
+
+    def test_roadmap_progress_is_saved_to_the_account(self):
+        self.sign_up(self.app())
+        at = self.log_in(self.app())
+        self.nav(at).set_value("🗓️ 30-Day Skill Roadmap").run()
+        widget(at, "text_input", "Skills to learn (comma-separated)").set_value("docker, kubernetes, tensorflow")
+        at.run()
+        at.checkbox[0].check().run()
+        self.assertEqual(self.sql("SELECT done_keys FROM roadmap_progress")[0][0], "1_0")
+        at2 = self.log_in(self.app())                                                  # a brand new session
+        self.nav(at2).set_value("🗓️ 30-Day Skill Roadmap").run()
+        widget(at2, "text_input", "Skills to learn (comma-separated)").set_value("docker, kubernetes, tensorflow")
+        at2.run()
+        self.assertTrue(at2.checkbox[0].value)                                         # the tick came back
 
 
 if __name__ == "__main__":

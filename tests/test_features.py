@@ -28,9 +28,17 @@ class NavigationWiringTests(unittest.TestCase):
         for option in options:
             self.assertRegex(src, rf'nav_page == "{re.escape(option)}"', f"no page for menu entry {option!r}")
 
+    def test_successful_signup_redirects_to_login(self):
+        src = (ROOT / "app.py").read_text()
+        branch = src.split("success, msg = register_user(")[1].split("st.error(msg)")[0]
+        self.assertIn("st.session_state.auth_goto = AUTH_LOGIN", branch)
+        self.assertIn("st.rerun()", branch)
+        self.assertIn('st.session_state.auth_view = st.session_state.pop("auth_goto")', src)  # applied before the radio is created
+        self.assertLess(src.index('st.session_state.pop("auth_goto")'), src.index('key="auth_view"'))
+
     def test_admin_page_is_only_offered_to_admins(self):
         src = (ROOT / "app.py").read_text()
-        self.assertRegex(src, r'if user\.get\("role"\) == "admin":\s+nav_options\.append\("📊 Admin Analytics"\)')
+        self.assertRegex(src, r'if user\.get\("role"\) in \("admin", "dept_admin"\):\s+nav_options\.append\("📊 Admin Analytics"\)')
 
 
 class CompareTests(unittest.TestCase):
@@ -213,7 +221,7 @@ class AdminAnalyticsTests(unittest.TestCase):
 
     def metrics(self, role="admin", population=(5,), **kw):
         cur = use_cursor(self.ns, FakeCursor(
-            fetchone=[(role,) if role else None, (10, 1, 2, 5), population, (3, 4, 20, 61.234)],
+            fetchone=[(role, "Computer Science") if role else None, (10, 1, 2, 5), population, (3, 4, 20, 61.234)],
             fetchall=[[("Computer Science", 4, 12, 70.0), ("Civil", 1, 2, 90.0), ("Other", 2, 3, 50.0)],
                       [("docker", 9, 5), ("sql", 4, 3)],
                       [(0, 2), (3, 5)],
@@ -231,7 +239,7 @@ class AdminAnalyticsTests(unittest.TestCase):
 
     def test_role_is_checked_in_the_database_by_user_id(self):
         _, cur = self.metrics()
-        self.assertEqual(cur.executed[0], ("SELECT role FROM users WHERE id = %s", (99,)))
+        self.assertEqual(cur.executed[0], ("SELECT role, department FROM users WHERE id = %s", (99,)))
 
     def test_shapes_the_dashboard_data(self):
         m, _ = self.metrics()
