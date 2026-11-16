@@ -428,7 +428,7 @@ def verify_email_code(user_id, code):
     return True
 
 # ---------- "keep me signed in" (remember-me tokens) ----------
-def create_remember_token(user_id):
+def create_remember_token(user_id, lifetime_hours=REMEMBER_DAYS * 24):
     """Creates a random token for the browser cookie; only a keyed digest is stored. Returns None for unknown users."""
     token = secrets.token_urlsafe(32)
     with db_cursor() as c:
@@ -437,7 +437,7 @@ def create_remember_token(user_id):
         if not row:
             return None
         c.execute("INSERT INTO remember_tokens (user_id, token_digest, token_version, expires_at) VALUES (%s, %s, %s, %s)",
-                  (user_id, _otp_digest(token), row[0], datetime.now(timezone.utc) + timedelta(days=REMEMBER_DAYS)))
+                  (user_id, _otp_digest(token), row[0], datetime.now(timezone.utc) + timedelta(hours=lifetime_hours)))
         c.execute("DELETE FROM remember_tokens WHERE user_id = %s AND id NOT IN "
                   "(SELECT id FROM remember_tokens WHERE user_id = %s ORDER BY id DESC LIMIT %s)",
                   (user_id, user_id, MAX_REMEMBER_TOKENS))
@@ -1795,7 +1795,7 @@ if st.session_state.user is None:
                 with st.form("login_form"):
                     login_username = st.text_input("Username or Email", value=st.session_state.pop("login_prefill", ""))
                     login_password = st.text_input("Password", type="password", max_chars=MAX_PASSWORD_LEN)
-                    keep_signed_in = st.checkbox(f"Keep me signed in on this device ({REMEMBER_DAYS} days)")
+                    keep_signed_in = st.checkbox(f"Keep me signed in for {REMEMBER_DAYS} days (otherwise {SESSION_MAX_HOURS} hours)")
                     login_submitted = st.form_submit_button("Login", use_container_width=True, type="primary")
 
                     if login_submitted:
@@ -1812,8 +1812,10 @@ if st.session_state.user is None:
                                 st.rerun()
                             if user_record:
                                 start_session(user_record)
-                                if keep_signed_in:
-                                    st.session_state.pending_cookie = create_remember_token(user_record[0])
+                                hours = REMEMBER_DAYS * 24 if keep_signed_in else SESSION_MAX_HOURS  # a refresh must never log you out
+                                token = create_remember_token(user_record[0], hours)
+                                if token:
+                                    st.session_state.pending_cookie = (token, hours)
                                 st.rerun()
                             else:
                                 st.error(LOGIN_FAILED_MSG)
@@ -1903,7 +1905,8 @@ if st.session_state.user is None:
 else:
     user = st.session_state.user
     if st.session_state.get("pending_cookie"):
-        set_browser_cookie(REMEMBER_COOKIE, st.session_state.pop("pending_cookie"), REMEMBER_DAYS * 86400)
+        _cookie_token, _cookie_hours = st.session_state.pop("pending_cookie")
+        set_browser_cookie(REMEMBER_COOKIE, _cookie_token, _cookie_hours * 3600)
 
     # Sign out on idle timeout, deleted account, or after a password change/reset elsewhere.
     session_info = get_session_info(user["id"])
