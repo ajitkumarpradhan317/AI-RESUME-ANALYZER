@@ -1896,8 +1896,6 @@ if st.session_state.user is None:
                         else:
                             st.error(msg)
 
-    st.divider()
-    st.caption("7th Semester Engineering Project • Python, Supabase Postgres, Brevo HTTPS Email API, Scikit-Learn & Streamlit")
 
 # =========================================================
 # LOGGED-IN DASHBOARD VIEW
