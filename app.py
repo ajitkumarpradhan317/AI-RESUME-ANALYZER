@@ -15,6 +15,7 @@ import hashlib
 import secrets
 import psycopg2
 import psycopg2.errors
+import psycopg2.pool
 from contextlib import contextmanager
 import requests
 import pandas as pd
@@ -44,20 +45,86 @@ if not DATABASE_URL:
     )
     st.stop()
 
+POOL_PING_AFTER_SECONDS = 30   # a pooled connection idle for longer than this is tested before it is reused
+
+def _connection_settings():
+    """SSL is required by default (Supabase); set DB_SSLMODE=disable only for a local/CI test database."""
+    return dict(connect_timeout=10, sslmode=get_config("DB_SSLMODE", "require"),
+                keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+class DbPool:
+    """A small thread-safe connection pool. Streamlit re-runs the whole script on every click, so opening a new
+    connection per query meant a TLS handshake and login to Supabase each time (0.3-1 s). Re-using connections avoids that."""
+    def __init__(self, dsn, maxconn):
+        self.dsn, self.last_used = dsn, {}
+        self.pool = psycopg2.pool.ThreadedConnectionPool(1, maxconn, dsn, **_connection_settings())
+
+    @staticmethod
+    def _alive(conn):
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+            return True
+        except Exception:
+            return False
+
+    def acquire(self):
+        """Returns (connection, pooled). If every pooled connection is busy, a one-off connection is used instead of failing."""
+        try:
+            conn = self.pool.getconn()
+        except psycopg2.pool.PoolError:
+            return psycopg2.connect(self.dsn, **_connection_settings()), False
+        idle = time.time() - self.last_used.get(id(conn), 0)
+        if conn.closed or (idle > POOL_PING_AFTER_SECONDS and not self._alive(conn)):  # the server may have dropped it while idle
+            self.pool.putconn(conn, close=True)
+            self.last_used.pop(id(conn), None)
+            conn = self.pool.getconn()
+        return conn, True
+
+    def release(self, conn, pooled, broken):
+        if not pooled:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        elif broken or conn.closed:
+            self.last_used.pop(id(conn), None)
+            self.pool.putconn(conn, close=True)
+        else:
+            self.last_used[id(conn)] = time.time()
+            self.pool.putconn(conn)
+
+@st.cache_resource(show_spinner=False)
+def _get_db_pool():
+    """One pool per server process (Streamlit caches it across re-runs and sessions)."""
+    try:
+        maxconn = max(1, min(int(get_config("DB_POOL_MAX", "5")), 20))
+    except ValueError:
+        maxconn = 5
+    return DbPool(DATABASE_URL, maxconn)
+
 @contextmanager
 def db_cursor():
-    """Opens a short-lived connection (pooler-friendly), commits on success, rolls back on error.
-    SSL is required by default (Supabase); set DB_SSLMODE=disable only for a local/CI test database."""
-    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10, sslmode=get_config("DB_SSLMODE", "require"))
+    """Yields a cursor on a pooled connection; commits on success, rolls back on error."""
+    db = _get_db_pool()
+    conn, pooled = db.acquire()
+    broken = False
     try:
         with conn.cursor() as cur:
             yield cur
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        broken = True            # the connection itself failed: discard it instead of returning it to the pool
+        raise
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception:
+            broken = True
         raise
     finally:
-        conn.close()
+        db.release(conn, pooled, broken)
 
 @st.cache_resource(show_spinner="Connecting to Supabase...")
 def _init_db_cached():
@@ -897,14 +964,16 @@ def save_scan_record(user_id, resume_name, target_role, match_score, matched_cou
             (user_id, resume_name, target_role, match_score, matched_count, ", ".join(missing_keywords))
         )
 
-def get_user_scans(user_id):
-    """Fetches all past scans for a specific user."""
+MAX_SCANS_LOADED = 1000
+
+def get_user_scans(user_id, limit=MAX_SCANS_LOADED):
+    """Fetches a user's most recent scans (newest first, never more than MAX_SCANS_LOADED)."""
     with db_cursor() as c:
         c.execute(
             """SELECT id, resume_name, target_role, match_score, matched_count, missing_keywords,
                       to_char(scanned_at, 'YYYY-MM-DD HH24:MI')
-               FROM scans WHERE user_id = %s ORDER BY id DESC""",
-            (user_id,)
+               FROM scans WHERE user_id = %s ORDER BY id DESC LIMIT %s""",
+            (user_id, max(1, min(int(limit), MAX_SCANS_LOADED)))
         )
         rows = c.fetchall()
     return pd.DataFrame(rows, columns=[
@@ -1055,6 +1124,22 @@ div[data-testid="stForm"] {border-radius: 16px; border: 1px solid rgba(128,128,1
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+def get_session_and_stats(user_id):
+    """Everything a page load needs from the database in ONE round trip: the session facts (token version, role,
+    department) and the sidebar counters (scan count, average score) computed by the database, not by downloading rows.
+    Returns (session_info, stats), or (None, None) if the account no longer exists."""
+    with db_cursor() as c:
+        c.execute(
+            "SELECT u.token_version, u.role, u.department, "
+            "(SELECT count(*) FROM scans s WHERE s.user_id = u.id), "
+            "(SELECT COALESCE(avg(s.match_score), 0) FROM scans s WHERE s.user_id = u.id) "
+            "FROM users u WHERE u.id = %s", (user_id,))
+        row = c.fetchone()
+    if not row:
+        return None, None
+    return ({"token_version": row[0], "role": row[1], "department": row[2]},
+            {"total": int(row[3]), "average": round(float(row[4]), 1)})
 
 def session_fields(user_id):
     """Server-side facts stored in the browser session at login (token version, role, department)."""
@@ -1909,7 +1994,7 @@ else:
         set_browser_cookie(REMEMBER_COOKIE, _cookie_token, _cookie_hours * 3600)
 
     # Sign out on idle timeout, deleted account, or after a password change/reset elsewhere.
-    session_info = get_session_info(user["id"])
+    session_info, scan_stats = get_session_and_stats(user["id"])  # one query per page load, not two
     if (time.time() - st.session_state.get("last_active", 0) > SESSION_IDLE_MINUTES * 60
             or time.time() - st.session_state.get("login_at", 0) > SESSION_MAX_HOURS * 3600
             or session_info is None or session_info["token_version"] != user.get("token_version")):
@@ -1949,11 +2034,9 @@ else:
         nav_page = st.radio("Navigation", nav_options)
 
         st.divider()
-        user_scans_df = get_user_scans(user["id"])
-        st.metric("Total Resumes Scanned", len(user_scans_df))
-        if not user_scans_df.empty:
-            avg_score = round(user_scans_df["Score (%)"].mean(), 1)
-            st.metric("Average ATS Score", f"{avg_score}%")
+        st.metric("Total Resumes Scanned", scan_stats["total"])
+        if scan_stats["total"]:
+            st.metric("Average ATS Score", f"{scan_stats['average']}%")
 
         st.divider()
         if st.button("🚪 Logout", use_container_width=True):
@@ -2242,6 +2325,8 @@ else:
         hero("🕒 Scan History", f"Every resume evaluation saved for {user['full_name']}, with your score progress over time.")
 
         scans_df = get_user_scans(user["id"])
+        if len(scans_df) >= MAX_SCANS_LOADED:
+            st.caption(f"Showing your latest {MAX_SCANS_LOADED} scans.")
         if scans_df.empty:
             st.info("You haven't scanned any resumes yet. Go to **Single Resume Analyzer** or **Batch Ranker** to get started!")
         else:
@@ -2548,7 +2633,7 @@ else:
     elif nav_page == "🗓️ 30-Day Skill Roadmap":
         hero("🗓️ 30-Day Skill Roadmap", "Turn your missing keywords into a weekly learning checklist with project ideas.")
         last = st.session_state.last_single_result
-        history = get_user_scans(user["id"]).head(20)
+        history = get_user_scans(user["id"], 20)
         sources = (["My last analysis"] if last else []) + (["A saved scan"] if not history.empty else []) + ["Type skills myself"]
         source = st.radio("Build the roadmap from:", sources, horizontal=True)
         missing, rm_role = [], ""
